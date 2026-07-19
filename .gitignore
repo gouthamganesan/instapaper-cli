@@ -1,0 +1,8 @@
+# Never commit credentials or local config
+.env
+username
+config
+
+__pycache__/
+*.py[cod]
+.DS_Store

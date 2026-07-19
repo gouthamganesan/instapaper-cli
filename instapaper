@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""instapaper — save URLs to your Instapaper inbox from the command line.
+
+Wraps the Instapaper Simple API (https://www.instapaper.com/developers/v1/simple-api).
+Stdlib only, no dependencies. Credentials come from the macOS Keychain.
+
+Usage:
+    instapaper add <url> [<url> ...] [--title T] [--selection S]
+    instapaper add --stdin          # one URL per line
+    instapaper auth                 # verify stored credentials
+
+Setup (run once, yourself):
+    echo -n 'you@example.com' > ~/.config/instapaper/username
+    security add-generic-password -s instapaper -a "$(cat ~/.config/instapaper/username)" -w
+
+The password lives only in the Keychain. If your Instapaper account has no
+password (common), store an empty string.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_ADD = "https://www.instapaper.com/api/add"
+API_AUTH = "https://www.instapaper.com/api/authenticate"
+KEYCHAIN_SERVICE = "instapaper"
+CONFIG_DIR = os.path.expanduser("~/.config/instapaper")
+USERNAME_FILE = os.path.join(CONFIG_DIR, "username")
+
+STATUS_MESSAGES = {
+    400: "Bad request (malformed or missing URL)",
+    403: "Invalid username or password",
+    500: "Instapaper server error, try again later",
+}
+
+
+def die(msg, code=1):
+    print(f"instapaper: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def get_username():
+    if env := os.environ.get("INSTAPAPER_USERNAME"):
+        return env
+    try:
+        with open(USERNAME_FILE) as f:
+            username = f.read().strip()
+    except FileNotFoundError:
+        die(f"no username found. Write it to {USERNAME_FILE} or set INSTAPAPER_USERNAME.")
+    if not username:
+        die(f"{USERNAME_FILE} is empty.")
+    return username
+
+
+def get_password(username):
+    """Resolve the password: env var first, then the macOS Keychain.
+
+    An empty password is valid — many Instapaper accounts have none.
+    INSTAPAPER_PASSWORD exists so this works off macOS (Linux, CI, containers),
+    where there is no Keychain to read from.
+    """
+    if (env := os.environ.get("INSTAPAPER_PASSWORD")) is not None:
+        return env
+
+    if sys.platform != "darwin":
+        die(
+            "no password source. Set INSTAPAPER_PASSWORD — Keychain lookup is "
+            "macOS-only. Use an empty string if your account has no password."
+        )
+
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", username, "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(
+            f"no Keychain entry for service '{KEYCHAIN_SERVICE}' account '{username}'.\n"
+            f"  Create it with:\n"
+            f"    security add-generic-password -s {KEYCHAIN_SERVICE} -a {username} -w"
+        )
+    return result.stdout.rstrip("\n")
+
+
+def call(endpoint, params):
+    """POST form-encoded params. Returns (status, headers)."""
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=data, method="POST")
+    req.add_header("User-Agent", "instapaper-cli/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers)
+    except urllib.error.URLError as e:
+        die(f"network error: {e.reason}")
+
+
+def cmd_auth(args, creds):
+    status, _ = call(API_AUTH, creds)
+    if status == 200:
+        print(f"ok: authenticated as {creds['username']}")
+        return 0
+    die(STATUS_MESSAGES.get(status, f"unexpected status {status}"))
+
+
+def cmd_add(args, creds):
+    urls = args.urls
+    if args.stdin:
+        urls += [line.strip() for line in sys.stdin if line.strip()]
+    if not urls:
+        die("no URLs given. Pass them as arguments or use --stdin.")
+    if len(urls) > 1 and (args.title or args.selection):
+        die("--title and --selection only apply to a single URL.")
+
+    failures = 0
+    for url in urls:
+        params = dict(creds, url=url)
+        if args.title:
+            params["title"] = args.title
+        if args.selection:
+            params["selection"] = args.selection
+
+        status, headers = call(API_ADD, params)
+        if status == 201:
+            title = headers.get("X-Instapaper-Title", "").strip()
+            print(f"saved: {title or url}")
+        else:
+            failures += 1
+            print(
+                f"failed ({status}): {url} — "
+                f"{STATUS_MESSAGES.get(status, 'unknown error')}",
+                file=sys.stderr,
+            )
+    return 1 if failures else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="instapaper",
+        description="Save URLs to your Instapaper inbox.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="save one or more URLs")
+    p_add.add_argument("urls", nargs="*", help="URLs to save")
+    p_add.add_argument("--title", help="override the article title (single URL only)")
+    p_add.add_argument("--selection", help="a note or excerpt (single URL only)")
+    p_add.add_argument("--stdin", action="store_true", help="read URLs from stdin, one per line")
+    p_add.set_defaults(func=cmd_add)
+
+    p_auth = sub.add_parser("auth", help="verify stored credentials")
+    p_auth.set_defaults(func=cmd_auth)
+
+    args = parser.parse_args()
+
+    username = get_username()
+    creds = {"username": username, "password": get_password(username)}
+    sys.exit(args.func(args, creds))
+
+
+if __name__ == "__main__":
+    main()
