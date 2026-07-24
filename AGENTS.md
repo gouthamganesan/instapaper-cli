@@ -73,11 +73,40 @@ re-export overwrites the file for any bookmark whose hash or highlights
 changed. If the user wants notes alongside an exported article, that's a
 separate file, not an edit to the exported `.md`.
 
+### `tools/inbox.py` — triage the unread queue
+
+The two things `instapaper` deliberately doesn't do: list bookmarks with their
+saved timestamps, and archive an existing one.
+
+```sh
+python3 tools/inbox.py list --json                           # read-only, always safe
+python3 tools/inbox.py archive --before YYYY-MM-DD           # DRY RUN by default
+python3 tools/inbox.py archive --before YYYY-MM-DD --apply   # actually archives
+```
+
+Trigger `list` on "what's in my inbox", "how old are these", "what's clogging
+my queue". It's the cheap answer — reach for it rather than `export` when the
+user wants to *see* the queue, since `export` downloads every article's full
+text to answer a question about dates.
+
+Full API only, so `login` must have run. It imports `instapaper_cli.creds` and
+`instapaper_cli.transport` directly; don't reimplement the signer, and don't
+patch `sys.path` by hand — it resolves the package from its own `__file__`.
+
+**Never run `archive --apply` without showing the dry run first**, and never
+run it on a queue the user hasn't seen. Archiving moves a bookmark to the
+Archive folder and is reversible, but it's still the only operation in this
+repo that changes server state, so it gets the ceremony.
+
 ## What NOT to do
 
-**Do not** attempt to delete, unstar, or otherwise mutate a bookmark from this
-tool. There is no delete/mutate command — `add` and `export` are the whole
-surface, and no amount of flag-guessing will find one.
+**Do not** attempt to delete a bookmark. Nothing here can, and no amount of
+flag-guessing will find a way. `add`, `export`, and `tools/inbox.py`'s archive
+are the whole mutating surface, and archive only *moves*.
+
+**Do not** try to archive from `instapaper` itself. It isn't there by design —
+`tools/inbox.py` is where that lives, precisely so the CLI's "only ever adds
+and reads" contract stays literally true.
 
 **Do not** resolve a folder *name* to an id yourself by guessing or calling
 some other endpoint. `--folder` only accepts a numeric id or the literals
@@ -152,6 +181,7 @@ bookmarks.
 | `instapaper_cli/htmlmd.py` | Deliberately-lossy HTML → Markdown converter (stdlib `html.parser`) used to render exported article text. |
 | `instapaper_cli/render.py` | Turns a bookmark dict + highlight list + article Markdown into one note file's exact text (frontmatter, `[!quote]` callouts, body). |
 | `instapaper_cli/sync.py` | The incremental `export` engine — diffs local state against the server via `have=id:hash` and a highlight-id delta, fetches only what's dirty. |
+| `tools/inbox.py` | Standalone triage script, **not** part of the CLI's command tree. Lists bookmarks with saved timestamps and archives existing ones. Imports `creds` + `transport`; the only thing in the repo that mutates server state, and its one mutation moves rather than deletes. Lives outside the package on purpose. |
 
 The Simple API contract this depends on is documented at
 <https://www.instapaper.com/developers/v1/simple-api>; the Full API at

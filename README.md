@@ -272,6 +272,43 @@ one-way, Instapaper → your disk.
 - `--dry-run` runs the whole diff and logs intended actions but writes no
   files and doesn't touch the sync state.
 
+### `tools/inbox.py` — list with timestamps, archive existing bookmarks
+
+A small script beside the package, not a subcommand. It covers the two things
+`instapaper` deliberately doesn't: seeing *when* each bookmark was saved, and
+moving an existing one to the Archive folder.
+
+```sh
+python3 tools/inbox.py list                                  # unread, oldest first
+python3 tools/inbox.py list --folder archive --json
+python3 tools/inbox.py list --before 2026-06-01              # only older saves
+
+python3 tools/inbox.py archive --before 2026-06-01           # DRY RUN
+python3 tools/inbox.py archive --before 2026-06-01 --apply   # actually archives
+python3 tools/inbox.py archive --ids 123,456 --apply
+```
+
+Full API only, so `instapaper login` has to have run first. It imports
+`instapaper_cli.creds` and `instapaper_cli.transport` rather than
+reimplementing the OAuth signer, and resolves the package relative to its own
+`__file__`, so it works from any directory.
+
+Three deliberate properties:
+
+- **`archive` is a dry run unless you pass `--apply`.** The dry run prints
+  every bookmark it would touch, so the destructive-looking operation is always
+  previewed first.
+- **Archiving moves, it never deletes.** `/bookmarks/archive` relocates a
+  bookmark to the Archive folder; it stays in your account and can be moved
+  back.
+- **It's a script you invoke by path, not a subcommand.** That's the seam that
+  keeps the CLI's own contract honest — see "What this can and can't do".
+
+Why `list` exists at all: `export` gives you the full text of everything, which
+is the wrong tool for "what's clogging my inbox and how old is it". `list
+--json` is the cheap answer, and it's what a triage agent wants before deciding
+anything.
+
 ## What this can and can't do
 
 The **Simple API** (used by default `add`, and by `auth`) is add-only: no
@@ -285,8 +322,12 @@ The **Full API** (OAuth, opt-in via `login`) adds:
 
 Still out of scope, deliberately:
 
-- **No delete.** This tool only ever adds and reads. Deleting or archiving
-  from the CLI isn't implemented.
+- **No delete.** Nothing in this repo can delete a bookmark. The API supports
+  it; this doesn't implement it.
+- **No archiving from `instapaper` itself.** Archiving an existing bookmark
+  lives in [`tools/inbox.py`](tools/inbox.py) instead (below). Keeping the one
+  mutating call out of the CLI is what lets "`instapaper` only ever adds and
+  reads" stay exactly true rather than approximately true.
 - **No folder-name resolution.** `--folder` on `add` and `export` accepts a
   numeric folder id or the literals `unread` / `starred` / `archive` — it does
   not call `folders/list` to resolve a name like `"Reading Later"` to an id.
