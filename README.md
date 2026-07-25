@@ -1,4 +1,15 @@
-# instapaper-cli
+<div align="center">
+<img src="assets/banner.png" alt="instapaper-cli — a stdlib-only CLI for Instapaper, built for keychain auth and coding agents" width="100%">
+<br><br>
+
+[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![Instapaper](https://img.shields.io/badge/Instapaper-Simple%20%2B%20Full%20API-428BCA?style=flat-square&logo=instapaper&logoColor=white)](https://www.instapaper.com/developers)
+[![Tests](https://img.shields.io/badge/tests-148%20passing-2ea44f?style=flat-square)](AGENTS.md#testing)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-success?style=flat-square)](#install)
+[![License: MIT](https://img.shields.io/badge/License-MIT-informational?style=flat-square)](LICENSE)
+
+**Save, organise, and export your entire Instapaper library from the terminal — no dependencies, no password ever touching disk.**
+</div>
 
 Save URLs to your Instapaper inbox from the command line — and, if you want
 more, export your library (bookmarks, highlights, notes, full article text) to
@@ -200,7 +211,12 @@ does to the saved bookmark.
 **Exit codes:** `0` if every URL saved, `1` if any failed or if configuration
 is missing. Per-URL failures print to stderr and do not abort the remaining
 URLs. `--json` emits `{"saved": [...], "failed": [...]}` on stdout instead of
-per-line text (still exit `1` on any failure).
+per-line text (still exit `1` on any failure). Each `saved` entry is
+`{"bookmark_id", "url", "title", "folder_id"}` — the `bookmark_id` lets a
+script move/tag/delete what it just saved without a follow-up `list` matched by
+URL. It's populated on the **Full-API path** (any of `--content`/`--folder`/
+`--tag`/`--archive`/`--description`); on the plain Simple-API path the API
+returns no id, so `bookmark_id` and `folder_id` are `null`.
 
 On success the tool prints the title Instapaper resolved server-side — from
 `X-Instapaper-Title` on the Simple path, from the response body on the
@@ -222,17 +238,26 @@ that's the layer everything else depends on.
 ### `list` — see what's in a folder
 
 ```sh
-instapaper list                              # unread, oldest first: date, id, title, tags
+instapaper list                              # unread, oldest-first: date, id, title, tags
 instapaper list --folder starred
 instapaper list --folder "Reading List"       # by name, id, or unread/starred/archive
 instapaper list --before 2026-06-01           # only saves older than a date
-instapaper list --json                        # id, title, url, saved, time, starred, tags
+instapaper list --order newest                # newest-first, matching the app's display
+instapaper list --json                        # bookmark_id, title, url, saved, time, starred, tags
 ```
 
 Full-API only. This is how you find the **bookmark ids** the mutation verbs
 below need — a starred bookmark is marked `*`, tags print as `#tag`, and the
 stderr summary line reports the count. `--folder` resolves a display name the
-same way `add` does.
+same way `add` does. The JSON id field is `bookmark_id` — the same name
+`export` frontmatter and the mutation verbs use, so a script written against
+one works against all of them.
+
+**Ordering:** `list` is **oldest-first** by default; the Instapaper app shows a
+folder **newest-first**. That inversion is why "send the reading order in
+reverse" used to be the only trick available — `--order newest` now gives you
+the app's order directly, and `--order oldest` (the default) is the
+chronological one. The two are exact reverses of the same fetched set.
 
 ### `archive` / `unarchive` — move bookmarks in and out of the Archive
 
@@ -272,9 +297,12 @@ instapaper delete 2029214705 111 --yes        # actually deletes (no undo)
 
 `delete` is **permanent** — it destroys the bookmark and its highlights — so it
 will not run without `--yes`. Prefer `archive` when you just want it out of your
-unread queue. Across all these verbs, a per-id failure is reported and does not
-abort the rest; exit `0` only if every id succeeded, and `--json` emits a
-`{"<verb>": [...ids], "failed": [...]}` summary.
+unread queue. Across all these verbs each id is processed independently: a
+per-id failure is reported and does **not** abort the rest, and any failure
+flips the exit code to `1`. When more than one id is given, a summary line goes
+to stderr (`deleted 3`, or `deleted 2, failed 1` on a partial failure) so a
+batch that only half-worked can't hide behind the per-id success lines. `--json`
+emits `{"<verb>": [...ids], "failed": [{"bookmark_id", "error"}, ...]}`.
 
 ### `folder` — list, create, or delete folders
 
@@ -333,6 +361,7 @@ instapaper export --folder 12345678              # a numeric folder id
 instapaper export --refresh-highlights           # re-fetch highlights for every known bookmark
 instapaper export --prune                        # delete local files for server-deleted bookmarks
 instapaper export --dry-run                      # report what would happen, write nothing
+instapaper export --timeout 60 --retries 3       # tune network resilience (defaults: 30s, 2)
 instapaper export --limit 200 --json
 ```
 
@@ -360,6 +389,15 @@ one-way, Instapaper → your disk.
   the sync state (the file is left alone) — the safer default.
 - `--dry-run` runs the whole diff and logs intended actions but writes no
   files and doesn't touch the sync state.
+- `--timeout` / `--retries` tune network resilience. `get_text` in particular
+  is prone to intermittent SSL-read timeouts; each Full-API request is retried
+  up to `--retries` times (default 2) with exponential backoff on a
+  timeout/network/5xx/rate-limit failure. If a single bookmark still fails after
+  its retries, **that bookmark is skipped and recorded in the errors list — the
+  run continues** rather than aborting the whole export. Raise `--timeout`
+  (seconds, default 30) for a slow connection. (macOS has no `timeout(1)`
+  binary, so don't reach for a shell wrapper — these flags are the supported
+  way to bound a run.)
 
 > **Where did `tools/inbox.py` go?** Earlier versions shipped a standalone
 > `tools/inbox.py` script for listing bookmarks with timestamps and bulk-archiving
@@ -417,7 +455,7 @@ that adding an existing URL marks it unread and moves it to the top of the
 list, still returning `201`. This makes repeat calls safe and is why the tool
 keeps no local cache of what it has already sent on the `add` path.
 
-Two caveats on that, stated plainly because they are easy to over-trust:
+Three caveats on that, stated plainly because they are easy to over-trust:
 
 - The dedup happens server-side on the URL string. `https://x.com/post` and
   `https://x.com/post?utm_source=rss` are different strings and will plausibly
@@ -430,12 +468,38 @@ Two caveats on that, stated plainly because they are easy to over-trust:
   in an `export`'s frontmatter. Keep that in mind if you toggle freedium on
   and off over time; the same article saved both ways will look like two
   bookmarks.
+- **"Moves to the top" is the Simple-API path only.** A Full-API re-add (any
+  call with `--content`/`--folder`/`--tag`/…) dedups on the same exact URL and
+  **updates the stored bookmark in place** — new `--content` HTML does land —
+  but it **keeps the same `bookmark_id` and its existing position**; it does
+  *not* reset the save-time or bump the item to the top. So you can update a
+  bookmark's content via re-add, but you can't reorder a folder that way. There
+  is deliberately **no ordering/"bump-to-top" primitive**: Instapaper exposes
+  no documented endpoint to reset a bookmark's save-time, and faking one on
+  undocumented behaviour would be the kind of "reports success, changes
+  nothing" trap this tool tries to avoid. If you need a specific reading order,
+  drive it at save time (send items in the order you want, oldest first) and
+  read it back with `list --order`.
 
 **Pages behind a login or a hard paywall** will save via the Simple API or
 plain Full-API `add`, but Instapaper's server-side parser may extract little
 or nothing — the `201`/success reflects acceptance of the URL, not a
 successful article extraction. Use `--content` to hand it the HTML directly
 when that matters.
+
+**External images in `--content` HTML are proxied, not re-hosted.** When you
+upload HTML via `--content`, Instapaper's reader keeps your external image URLs
+as-is and fetches them through its own image proxy — it does not download and
+re-host them. That proxy is pickier than a plain `curl`: an image URL that
+loads fine on its own can still render as a broken box in the reader. The
+failure mode seen in practice is **standard base64 in the URL** (the `+` and
+`/` characters) and **multi-parameter query strings** — e.g. a
+`mermaid.ink/img/<standard-base64>?type=png&bgColor=...` link. Switching to
+**URL-safe base64** (`-`/`_`) and a single query parameter fixed it across the
+board. So when you hand-build `--content` HTML with generated images, prefer
+url-safe image URLs, avoid `+`/`/` and stacked query params, and verify the
+images actually render in the Instapaper reader — a clean `curl` is not proof.
+(This is Instapaper-platform behaviour, not something the CLI controls.)
 
 **`get_text` works without an approved Instaparser key for personal use** —
 when the app you registered and the account you're authenticated as are the
@@ -479,13 +543,17 @@ became a small package behind a thin entrypoint shim.
 | `instapaper_cli/render.py` | Turns a bookmark + highlights + article Markdown into one note file. |
 | `instapaper_cli/sync.py` | The incremental export engine — diffing against Instapaper via `have`/hash. |
 
-133 unit tests cover the library modules (`python3 instapaper_cli/test_*.py`,
+148 unit tests cover the library modules (`python3 instapaper_cli/test_*.py`,
 or `python3 -m unittest discover -s instapaper_cli -p 'test_*.py'`); see
-[Testing](AGENTS.md#testing) in AGENTS.md for the doctrine. Deeper
-design/teaching notes on how the pieces fit together live in
-[`docs/`](docs/) — an interlinked set covering the OAuth signing math, the
-incremental sync algorithm, and the freedium/routing decisions — start there
-if you want the internals, not just the interface.
+[Testing](AGENTS.md#testing) in AGENTS.md for the doctrine.
+
+## Credits
+
+This is an unofficial, independent client. It is not affiliated with, endorsed
+by, or supported by Instapaper. "Instapaper" and the Instapaper mark, and the
+Python, Apple, and Claude marks used in the header image, belong to their
+respective owners and appear here only to indicate what the tool talks to.
+Brand marks in the banner come from [Simple Icons](https://simpleicons.org).
 
 ## Licence
 
