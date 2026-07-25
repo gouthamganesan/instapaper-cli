@@ -61,6 +61,28 @@ def _extract_title(result):
     return ""
 
 
+def _extract_bookmark_id(result):
+    """Pull the bookmark_id out of a Full-API bookmarks/add response, or None.
+
+    The Full API returns the created/updated bookmark object (same id on a
+    re-add of an existing URL — see the dedup note in the README). Returning it
+    here lets a caller move/delete/tag what it just saved without a follow-up
+    ``list`` matched by URL string.
+    """
+    items = result if isinstance(result, list) else [result]
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "bookmark"
+            and item.get("bookmark_id") is not None
+        ):
+            return item.get("bookmark_id")
+    for item in items:
+        if isinstance(item, dict) and item.get("bookmark_id") is not None:
+            return item.get("bookmark_id")
+    return None
+
+
 def _extract_username(resp):
     """Pull the username out of a verify_credentials response."""
     items = resp if isinstance(resp, list) else [resp]
@@ -143,7 +165,12 @@ def cmd_add(args):
             try:
                 result = transport.api_call("/bookmarks/add", params, oc)
                 title = _extract_title(result)
-                saved.append({"url": send_url, "title": title})
+                saved.append({
+                    "bookmark_id": _extract_bookmark_id(result),
+                    "url": send_url,
+                    "title": title,
+                    "folder_id": folder_id,
+                })
                 if not args.json:
                     print("saved: {}".format(title or send_url))
             except (transport.ApiError, transport.NetworkError) as e:
@@ -162,7 +189,14 @@ def cmd_add(args):
             status, headers = transport.simple_call(transport.SIMPLE_ADD, params)
             if status == 201:
                 title = headers.get("X-Instapaper-Title", "").strip()
-                saved.append({"url": send_url, "title": title})
+                # The Simple API returns no bookmark id — null it, but keep the
+                # same schema as the Full-API path so callers can rely on it.
+                saved.append({
+                    "bookmark_id": None,
+                    "url": send_url,
+                    "title": title,
+                    "folder_id": None,
+                })
                 if not args.json:
                     print("saved: {}".format(title or send_url))
             else:
@@ -229,11 +263,15 @@ def _list_rows(oc, folder, limit, before):
 def cmd_list(args):
     oc = creds.load_oauth_creds()
     rows = _list_rows(oc, args.folder, args.limit, args.before)
+    # _list_rows returns oldest-first; --order newest flips to match how the
+    # Instapaper app shows a folder (newest save on top).
+    if args.order == "newest":
+        rows = list(reversed(rows))
 
     if args.json:
         print(json.dumps([
             {
-                "id": b.get("bookmark_id"),
+                "bookmark_id": b.get("bookmark_id"),
                 "title": b.get("title", ""),
                 "url": b.get("url", ""),
                 "saved": _saved_str(b),
@@ -269,7 +307,12 @@ def _check_ids(ids):
 
 
 def _mutate_bookmarks(oc, ids, fn, verb, as_json):
-    """Apply fn(oc, id) to each id, collecting done/failed. Returns an exit code."""
+    """Apply fn(oc, id) to each id, collecting done/failed. Returns an exit code.
+
+    Per-id iteration is deliberate: one bad id fails only itself, the rest still
+    run, and any failure flips the exit code to 1. A summary line (human mode)
+    keeps a *partial* failure from hiding behind the success-shaped per-id lines.
+    """
     done, failed = [], []
     for bid in ids:
         try:
@@ -278,11 +321,15 @@ def _mutate_bookmarks(oc, ids, fn, verb, as_json):
             if not as_json:
                 print("{}: {}".format(verb, bid))
         except (transport.ApiError, transport.NetworkError) as e:
-            failed.append({"id": bid, "error": str(e)})
+            failed.append({"bookmark_id": bid, "error": str(e)})
             if not as_json:
                 _print_error_with_hint("failed: {}".format(bid), e)
     if as_json:
         print(json.dumps({verb: done, "failed": failed}))
+    elif failed:
+        print("{} {}, failed {}".format(verb, len(done), len(failed)), file=sys.stderr)
+    elif len(ids) > 1:
+        print("{} {}".format(verb, len(done)), file=sys.stderr)
     return 1 if failed else 0
 
 
@@ -590,6 +637,8 @@ def cmd_export(args):
         prune=args.prune,
         dry_run=args.dry_run,
         log=lambda m: print(m, file=sys.stderr),
+        timeout=args.timeout,
+        retries=args.retries,
     )
 
     if args.json:
@@ -658,6 +707,8 @@ def build_parser():
     p_list.add_argument("--before", metavar="YYYY-MM-DD",
                         help="only bookmarks saved before this date")
     p_list.add_argument("--limit", type=int, default=500, help="max bookmarks (1-500)")
+    p_list.add_argument("--order", choices=["oldest", "newest"], default="oldest",
+                        help="sort order (default: oldest-first; 'newest' matches the app)")
     p_list.add_argument("--json", action="store_true", help="emit a JSON array")
     p_list.set_defaults(func=cmd_list)
 
@@ -774,6 +825,10 @@ def build_parser():
                           help="delete note files for bookmarks removed upstream")
     p_export.add_argument("--limit", type=int, default=500, help="max bookmarks per folder")
     p_export.add_argument("--dry-run", action="store_true", help="report intended actions only")
+    p_export.add_argument("--timeout", type=float, default=30,
+                          help="per-request socket timeout in seconds (default: 30)")
+    p_export.add_argument("--retries", type=int, default=2,
+                          help="retries per request on timeout/5xx/network error (default: 2)")
     p_export.add_argument("--json", action="store_true", help="emit a JSON summary object")
     p_export.set_defaults(func=cmd_export)
 

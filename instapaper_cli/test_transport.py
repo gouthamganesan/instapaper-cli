@@ -7,6 +7,7 @@ real socket layer is never touched.
 import io
 import json
 import os
+import socket
 import sys
 import unittest
 import urllib.error
@@ -175,6 +176,109 @@ class ApiCallTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.error_code, 1041)
         self.assertEqual(ctx.exception.http_status, 400)
+
+
+class _ReadTimeoutResponse:
+    """A urlopen result whose body read() times out (the SSL-read case)."""
+
+    status = 200
+
+    def read(self):
+        raise socket.timeout("timed out")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TimeoutAndRetryTests(unittest.TestCase):
+    def test_read_timeout_becomes_networkerror(self):
+        """A socket.timeout raised during resp.read() (not a URLError) is
+        converted to NetworkError instead of escaping uncaught."""
+
+        def fake_urlopen(req, timeout=None):
+            return _ReadTimeoutResponse()
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(transport.NetworkError):
+                transport.api_call(
+                    "/bookmarks/get_text", {"bookmark_id": 1}, CREDS, raw=True
+                )
+
+    def test_connect_timeout_via_urlerror_becomes_networkerror(self):
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError(socket.timeout("timed out"))
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(transport.NetworkError):
+                transport.api_call("/bookmarks/list", {}, CREDS)
+
+    def test_retries_until_success(self):
+        """Retryable failures are retried with backoff, then succeed."""
+        payload = [{"type": "bookmark", "bookmark_id": 1}]
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise urllib.error.URLError("temporary")
+            return _FakeResponse(json.dumps(payload).encode("utf-8"), status=200)
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen), \
+             mock.patch.object(transport.time, "sleep") as sleep:
+            result = transport.api_call("/bookmarks/list", {}, CREDS, retries=3)
+
+        self.assertEqual(result, payload)
+        self.assertEqual(calls["n"], 3)       # failed twice, third succeeded
+        self.assertEqual(sleep.call_count, 2)  # slept once before each retry
+
+    def test_retries_exhausted_reraises(self):
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError("down")
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen), \
+             mock.patch.object(transport.time, "sleep"):
+            with self.assertRaises(transport.NetworkError):
+                transport.api_call("/bookmarks/list", {}, CREDS, retries=2)
+
+    def test_non_retryable_error_is_not_retried(self):
+        """A real Instapaper error code (1220) is raised on the first attempt,
+        never retried, no matter how high --retries is."""
+        body = json.dumps(
+            [{"type": "error", "error_code": 1220, "message": "needs HTML"}]
+        ).encode("utf-8")
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise _http_error(400, body)
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen), \
+             mock.patch.object(transport.time, "sleep") as sleep:
+            with self.assertRaises(transport.ApiError):
+                transport.api_call("/bookmarks/add", {"url": "u"}, CREDS, retries=5)
+
+        self.assertEqual(calls["n"], 1)
+        sleep.assert_not_called()
+
+    def test_default_is_single_attempt(self):
+        """Without opting in, a retryable failure is still a single attempt —
+        no behaviour change for existing callers."""
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.URLError("down")
+
+        with mock.patch.object(transport.urllib.request, "urlopen", fake_urlopen), \
+             mock.patch.object(transport.time, "sleep") as sleep:
+            with self.assertRaises(transport.NetworkError):
+                transport.api_call("/bookmarks/list", {}, CREDS)
+
+        self.assertEqual(calls["n"], 1)
+        sleep.assert_not_called()
 
 
 class RetryableTests(unittest.TestCase):

@@ -60,9 +60,12 @@ class FakeApi:
         self.text_error = text_error
         self.text_html = text_html
         self.calls = []
+        self.tuning = []  # (timeout, retries) per api_call, to assert forwarding
 
-    def __call__(self, path, params, creds, *, base=transport.API_BASE, raw=False):
+    def __call__(self, path, params, creds, *, base=transport.API_BASE, raw=False,
+                 timeout=None, retries=0):
         self.calls.append((path, params, base, raw))
+        self.tuning.append((timeout, retries))
         if path == "/bookmarks/list":
             return self.list_response
         if path == "/bookmarks/get_text":
@@ -244,6 +247,41 @@ class SyncTests(unittest.TestCase):
         content = self._read(files[0])
         self.assertIn("kept highlight", content)
         self.assertIn("## Article", content)  # section present, body empty
+
+    # (5b) A transport failure (timeout/network) on get_text skips that
+    # bookmark and records the error — it does NOT abort the whole run. This is
+    # the distinction from test_get_text_error_still_renders: an ApiError means
+    # "no extractable text" (absorbed), a NetworkError means the fetch failed.
+    def test_get_text_network_error_skips_bookmark_without_aborting(self):
+        fake = FakeApi(
+            list_response={
+                "bookmarks": [_bookmark()],
+                "highlights": [],
+                "delete_ids": [],
+            },
+            text_error=transport.NetworkError("timed out after 30s"),
+        )
+        res = self._run(fake, folder="archive")  # returning at all proves no abort
+
+        self.assertEqual(res.created, [])
+        self.assertEqual(len(res.errors), 1)
+        self.assertIn("123456", res.errors[0])
+        self.assertEqual(self._md_files(), [])  # nothing written for the failed one
+
+    def test_timeout_and_retries_forwarded_to_api_call(self):
+        fake = FakeApi(
+            list_response={
+                "bookmarks": [_bookmark()],
+                "highlights": [_highlight(911)],
+                "delete_ids": [],
+            },
+            highlights_by_id={"123456": [_highlight(911)]},
+        )
+        self._run(fake, folder="archive", timeout=5, retries=4)
+        # every Full-API call this run made — list, highlights, get_text —
+        # carried the tuning through, so a flaky server is retried everywhere.
+        self.assertTrue(fake.tuning)
+        self.assertTrue(all(t == (5, 4) for t in fake.tuning), fake.tuning)
 
     # (6) dry_run → no files, no state file.
     def test_dry_run_writes_nothing(self):

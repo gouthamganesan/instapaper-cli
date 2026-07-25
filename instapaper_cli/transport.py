@@ -19,6 +19,8 @@ Library invariant: this module never calls sys.exit / print. It raises.
 """
 
 import json
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +48,14 @@ API_BASE_11 = "https://www.instapaper.com/api/1.1"
 
 _USER_AGENT = "instapaper-cli/2.0"
 _TIMEOUT = 30
+
+# Retry policy for api_call. Default 0 keeps every existing caller at exactly
+# one attempt (no behaviour change); callers that want resilience — export —
+# opt in by passing retries=N. Only retryable failures (timeouts, network
+# errors, 5xx, rate-limit) are retried; a real 4xx/error-code is raised at once.
+_DEFAULT_RETRIES = 0
+_BACKOFF_BASE = 0.5  # seconds — the first retry waits this long
+_BACKOFF_CAP = 8.0   # seconds — ceiling on the exponential backoff
 
 
 class NetworkError(Exception):
@@ -104,6 +114,8 @@ def simple_call(endpoint: str, params: dict) -> tuple:
             return resp.status, dict(resp.headers)
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers)
+    except (socket.timeout, TimeoutError):
+        raise NetworkError("timed out after {}s".format(_TIMEOUT))
     except urllib.error.URLError as e:
         raise NetworkError("network error: {}".format(e.reason))
 
@@ -125,6 +137,11 @@ def _find_error_object(parsed):
     return None
 
 
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff (seconds) for a 1-based retry ``attempt``, capped."""
+    return min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** (attempt - 1)))
+
+
 def api_call(
     path: str,
     params: dict,
@@ -132,6 +149,8 @@ def api_call(
     *,
     base: str = API_BASE,
     raw: bool = False,
+    timeout: float = None,
+    retries: int = _DEFAULT_RETRIES,
 ):
     """Make an OAuth-signed Full API POST and return the parsed result.
 
@@ -142,8 +161,31 @@ def api_call(
       or dict (bookmarks/list) is returned as-is.
     - HTTPError with a JSON error body → :class:`ApiError` carrying its code.
       A non-JSON error body is treated as a transient server error (retryable).
-    - URLError → :class:`NetworkError`.
+    - A socket timeout (connect *or* SSL read) and any URLError → a retryable
+      :class:`NetworkError`.
+    - ``timeout`` overrides the per-request socket timeout (default 30s).
+    - ``retries`` bounds automatic retries on *retryable* failures only
+      (timeouts, network errors, 5xx, rate-limit) with exponential backoff.
+      A real 4xx / Instapaper error code is raised on the first attempt.
+      Default 0 → a single attempt, unchanged from callers that don't opt in.
     """
+    timeout = _TIMEOUT if timeout is None else timeout
+    attempt = 0
+    while True:
+        try:
+            return _api_call_once(
+                path, params, creds, base=base, raw=raw, timeout=timeout
+            )
+        except (NetworkError, ApiError) as e:
+            can_retry = isinstance(e, NetworkError) or e.retryable
+            if not can_retry or attempt >= retries:
+                raise
+            attempt += 1
+            time.sleep(_retry_delay(attempt))
+
+
+def _api_call_once(path, params, creds, *, base, raw, timeout):
+    """One Full-API attempt. Retry/backoff lives in :func:`api_call`."""
     params = params or {}
     url = base + path
 
@@ -164,7 +206,7 @@ def api_call(
     req.add_header("User-Agent", _USER_AGENT)
 
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read()
             status = resp.status
     except urllib.error.HTTPError as e:
@@ -182,6 +224,10 @@ def api_call(
             )
         # HTTP error status but a well-formed non-error JSON body: still a failure.
         raise ApiError(e.code, None, "server error; retry later")
+    except (socket.timeout, TimeoutError):
+        # A read-phase (SSL) timeout raises a bare socket.timeout that is NOT a
+        # URLError, so it would otherwise escape uncaught and abort a batch.
+        raise NetworkError("timed out after {}s".format(timeout))
     except urllib.error.URLError as e:
         raise NetworkError("network error: {}".format(e.reason))
 
@@ -248,6 +294,8 @@ def xauth_access_token(
                 e.code, err_obj.get("error_code"), err_obj.get("message", "")
             )
         raise ApiError(e.code, None, "login failed")
+    except (socket.timeout, TimeoutError):
+        raise NetworkError("timed out after {}s".format(_TIMEOUT))
     except urllib.error.URLError as e:
         raise NetworkError("network error: {}".format(e.reason))
 

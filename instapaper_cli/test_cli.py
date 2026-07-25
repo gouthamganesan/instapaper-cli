@@ -149,7 +149,7 @@ class TestList(unittest.TestCase):
             rc, out, _err = run_main(["list", "--json"])
         self.assertEqual(rc, 0)
         data = json.loads(out)
-        self.assertEqual(data[0]["id"], 1)
+        self.assertEqual(data[0]["bookmark_id"], 1)
         self.assertEqual(data[0]["saved"], "2023-11-14")
         self.assertEqual(data[0]["tags"], ["x"])
         self.assertTrue(data[0]["starred"])
@@ -160,7 +160,7 @@ class TestList(unittest.TestCase):
                                side_effect=_fake_api(bmarks=[_OLD_BM, _NEW_BM])):
             rc, out, _err = run_main(["list", "--before", "2025-01-01", "--json"])
         self.assertEqual(rc, 0)
-        self.assertEqual([b["id"] for b in json.loads(out)], [1])
+        self.assertEqual([b["bookmark_id"] for b in json.loads(out)], [1])
 
     def test_folder_name_resolves_before_listing(self):
         with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
@@ -170,6 +170,51 @@ class TestList(unittest.TestCase):
         self.assertEqual(rc, 0)
         list_call = [c for c in api.call_args_list if c[0][0] == "/bookmarks/list"][0]
         self.assertEqual(list_call[0][1]["folder_id"], "222")
+
+    def test_order_defaults_oldest_first(self):
+        with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call",
+                               side_effect=_fake_api(bmarks=[_NEW_BM, _OLD_BM])):
+            rc, out, _err = run_main(["list", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([b["bookmark_id"] for b in json.loads(out)], [1, 2])
+
+    def test_order_newest_flips_to_match_app(self):
+        with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call",
+                               side_effect=_fake_api(bmarks=[_OLD_BM, _NEW_BM])):
+            rc, out, _err = run_main(["list", "--order", "newest", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([b["bookmark_id"] for b in json.loads(out)], [2, 1])
+
+
+class TestAddJsonBookmarkId(unittest.TestCase):
+    def test_full_mode_json_returns_bookmark_id_and_folder(self):
+        # /bookmarks/add returns the created bookmark object with its id.
+        resp = [{"type": "bookmark", "bookmark_id": 555, "title": "T"}]
+        with mock.patch.object(cli.config, "load_config", return_value=config.Config()), \
+             mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call", return_value=resp):
+            rc, out, _err = run_main(
+                ["add", "https://example.com/a", "--folder", "123", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(data["saved"][0]["bookmark_id"], 555)
+        self.assertEqual(data["saved"][0]["folder_id"], "123")
+        self.assertEqual(data["failed"], [])
+
+    def test_simple_mode_json_id_is_null_but_schema_matches(self):
+        with mock.patch.object(cli.config, "load_config", return_value=config.Config()), \
+             mock.patch.object(cli.creds, "simple_creds",
+                               return_value={"username": "u", "password": "p"}), \
+             mock.patch.object(cli.transport, "simple_call",
+                               return_value=(201, {"X-Instapaper-Title": "Hi"})):
+            rc, out, _err = run_main(["add", "https://example.com/a", "--json"])
+        self.assertEqual(rc, 0)
+        entry = json.loads(out)["saved"][0]
+        self.assertIsNone(entry["bookmark_id"])
+        self.assertIsNone(entry["folder_id"])
+        self.assertEqual(entry["title"], "Hi")
 
 
 class TestStarUnstarUnarchiveMove(unittest.TestCase):
@@ -359,6 +404,40 @@ class TestArchiveDelete(unittest.TestCase):
         rc, _out, err = run_main(["delete", "abc", "--yes"])
         self.assertEqual(rc, 1)
         self.assertIn("numeric", err)
+
+    def test_delete_multiple_ids_deletes_each_and_summarises(self):
+        with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call", return_value=[]) as api:
+            rc, out, err = run_main(["delete", "111", "222", "333", "--yes"])
+        self.assertEqual(rc, 0)
+        # per-id iteration: three separate delete calls, one per id
+        self.assertEqual([c[0][0] for c in api.call_args_list],
+                         ["/bookmarks/delete"] * 3)
+        self.assertEqual([c[0][1]["bookmark_id"] for c in api.call_args_list],
+                         ["111", "222", "333"])
+        self.assertIn("deleted 3", err)  # honest summary, not just per-id lines
+
+    def test_delete_partial_failure_exits_1_and_summarises(self):
+        def side(path, params, oc, *a, **kw):
+            if params.get("bookmark_id") == "222":
+                raise transport.NetworkError("boom")
+            return []
+        with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call", side_effect=side) as api:
+            rc, _out, err = run_main(["delete", "111", "222", "333", "--yes"])
+        self.assertEqual(rc, 1)                     # any failure → non-zero
+        self.assertEqual(len(api.call_args_list), 3)  # a bad id doesn't stop the rest
+        self.assertIn("deleted 2, failed 1", err)   # partial failure is loud
+
+    def test_delete_json_failed_entry_uses_bookmark_id_key(self):
+        with mock.patch.object(cli.creds, "load_oauth_creds", return_value=object()), \
+             mock.patch.object(cli.transport, "api_call",
+                               side_effect=transport.NetworkError("boom")):
+            rc, out, _err = run_main(["delete", "111", "--json", "--yes"])
+        self.assertEqual(rc, 1)
+        data = json.loads(out)
+        self.assertEqual(data["deleted"], [])
+        self.assertEqual(data["failed"][0]["bookmark_id"], "111")
 
 
 class TestFolderDelete(unittest.TestCase):

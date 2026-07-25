@@ -164,10 +164,15 @@ def _normalize_list_response(resp):
     return bookmarks, highlights, [str(d) for d in delete_ids]
 
 
-def _fetch_highlights(bid: str, creds) -> list:
+def _fetch_highlights(bid: str, creds, timeout=None, retries=0) -> list:
     """Fetch authoritative highlights for a bookmark (Full API 1.1)."""
     resp = transport.api_call(
-        "/bookmarks/{}/highlights".format(bid), {}, creds, base=transport.API_BASE_11
+        "/bookmarks/{}/highlights".format(bid),
+        {},
+        creds,
+        base=transport.API_BASE_11,
+        timeout=timeout,
+        retries=retries,
     )
     out = []
     if isinstance(resp, list):
@@ -177,11 +182,21 @@ def _fetch_highlights(bid: str, creds) -> list:
     return out
 
 
-def _fetch_text(bid: str, creds, log) -> str:
-    """Fetch and convert the article body; empty string on a no-text ApiError."""
+def _fetch_text(bid: str, creds, log, timeout=None, retries=0) -> str:
+    """Fetch and convert the article body; empty string on a no-text ApiError.
+
+    A transport failure (timeout / network error) is *not* swallowed here — it
+    propagates so the caller can retry-then-skip the bookmark rather than
+    silently recording an empty article for a fetch that never completed.
+    """
     try:
         body = transport.api_call(
-            "/bookmarks/get_text", {"bookmark_id": bid}, creds, raw=True
+            "/bookmarks/get_text",
+            {"bookmark_id": bid},
+            creds,
+            raw=True,
+            timeout=timeout,
+            retries=retries,
         )
     except ApiError as e:
         # 400 (and, defensively, any ApiError) means "no extractable text" —
@@ -208,11 +223,18 @@ def sync(
     prune=False,
     dry_run=False,
     log=lambda m: None,
+    timeout=None,
+    retries=0,
 ) -> SyncResult:
     """Incrementally export bookmarks + highlights + text to ``export_dir``.
 
     Returns a :class:`SyncResult` aggregating created / updated / pruned ids,
     an unchanged count, and any per-bookmark error messages.
+
+    ``timeout`` / ``retries`` are forwarded to every Full-API call so a slow or
+    flaky server (the SSL-read timeouts get_text is prone to) is retried with
+    backoff and, if it still fails, skips *that* bookmark instead of aborting
+    the whole run — the failure is recorded in :attr:`SyncResult.errors`.
     """
     state = load_state(export_dir)
     bookmarks_state = state["bookmarks"]
@@ -251,7 +273,9 @@ def sync(
 
         # --- Step 3: list call --------------------------------------------
         try:
-            resp = transport.api_call("/bookmarks/list", params, creds)
+            resp = transport.api_call(
+                "/bookmarks/list", params, creds, timeout=timeout, retries=retries
+            )
         except (ApiError, NetworkError) as e:
             result.errors.append("list({}): {}".format(folder_id, e))
             continue
@@ -318,8 +342,8 @@ def sync(
                 continue
 
             try:
-                highlights = _fetch_highlights(bid, creds)
-                article_md = _fetch_text(bid, creds, log)
+                highlights = _fetch_highlights(bid, creds, timeout, retries)
+                article_md = _fetch_text(bid, creds, log, timeout, retries)
 
                 note = render.render_note(meta, highlights, article_md)
 

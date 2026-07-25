@@ -68,6 +68,13 @@ only). It's safe to re-run: incremental via server-side hashing, and
 `--dry-run` exists precisely so you can preview a first run's scope (file
 count, roughly) before actually writing into the user's filesystem.
 
+Each Full-API request retries on a timeout/network/5xx failure (`--retries`,
+default 2) with backoff, and a bookmark that still fails is **skipped and
+recorded, not fatal** — the run finishes and reports the skips in the errors
+list, so a single flaky `get_text` no longer aborts the whole export. Bump
+`--timeout` (seconds, default 30) or `--retries` for a slow/unreliable link
+rather than wrapping the command in a shell `timeout` (macOS has none).
+
 **Treat exported files as generated output, not something to hand-edit.** A
 re-export overwrites the file for any bookmark whose hash or highlights
 changed. If the user wants notes alongside an exported article, that's a
@@ -112,12 +119,16 @@ decide, rather than adding `--yes` reflexively.
 instapaper list                               # unread, oldest-first: date, id, title, tags
 instapaper list --folder starred --json
 instapaper list --before YYYY-MM-DD           # only saves older than a date
+instapaper list --order newest                # newest-first (the app's order); default is oldest
 ```
 
 Read-only, always safe. This is the id-lookup primitive for the mutation verbs,
 and the cheap answer to "what's in my inbox / how old is it" — reach for it
 rather than `export` (which downloads every article's full text) when the user
-just wants to *see* the queue.
+just wants to *see* the queue. `list` is **oldest-first** by default while the
+app shows a folder **newest-first** — pass `--order newest` for the app's order
+instead of reversing the output yourself. In `--json`, the id field is
+`bookmark_id` (see the schema note under "Check the exit code" below).
 
 ### bulk archive by date
 
@@ -173,15 +184,39 @@ if you need structured output. `0` = everything succeeded (all URLs saved, or
 export completed with no per-bookmark errors), `1` = something failed.
 Per-item errors go to stderr (or the JSON `failed`/`errors` array) and do not
 stop the rest of the batch, so a partial success still exits `1` — that means
-"at least one failed," not "nothing worked."
+"at least one failed," not "nothing worked." For a multi-id mutation a summary
+line (`deleted 3`, or `deleted 2, failed 1`) also lands on stderr so a
+half-failed batch is visible without parsing.
+
+**One canonical id field: `bookmark_id`.** Every `--json` surface that names a
+bookmark's id uses the key `bookmark_id` — `list`, `add` (`saved[].bookmark_id`,
+`null` on the Simple-API path since it returns no id), the mutation verbs'
+`failed[].bookmark_id`, and `export` frontmatter. So the id you read out of
+`add --json` (Full-API path) or `list --json` feeds straight into `move` /
+`delete` / `archive` with no field renaming and no follow-up lookup. Don't
+write a script against a bare `id` key — that inconsistency was removed.
 
 Re-sending a URL the user already saved via plain `add` is harmless —
 Instapaper bumps rather than duplicates — so there's no need to track what
-you've sent. Two things still worth knowing, from the README: dedup is
-URL-string exact (tracking-parameter variants can double), and a
-Freedium-wrapped URL dedupes against its wrapped form, not the canonical
-article URL — toggling freedium on/off for the same article can produce two
-bookmarks.
+you've sent. Three things still worth knowing, from the README: dedup is
+URL-string exact (tracking-parameter variants can double); a Freedium-wrapped
+URL dedupes against its wrapped form, not the canonical article URL (toggling
+freedium on/off for the same article can produce two bookmarks); and the
+"bumps to the top" behaviour is the **Simple-API path only** — a Full-API
+re-add (with `--content`/`--folder`/…) updates the bookmark **in place**,
+keeping its `bookmark_id` and its existing position. So re-adding with new
+`--content` updates the stored HTML but will **not** reorder a folder, and
+there is no ordering/bump primitive to force it — if the user needs a reading
+order, save the items in that order (oldest first) and read back with
+`list --order`.
+
+**`--content` uploads keep external image URLs as-is** — Instapaper proxies
+them, it does not re-host. Its proxy is stricter than a plain fetch: images
+whose URL uses standard base64 (`+`/`/`) or a multi-parameter query string can
+render as broken boxes even though `curl` gets a clean `200`. When you generate
+`--content` HTML with external images (diagram services, etc.), prefer url-safe
+base64 (`-`/`_`) and single-parameter URLs, and verify the images actually
+render in the reader — a successful `curl` is not proof.
 
 ## Modifying the code
 
@@ -228,13 +263,11 @@ bookmarks.
 The Simple API contract this depends on is documented at
 <https://www.instapaper.com/developers/v1/simple-api>; the Full API at
 <https://www.instapaper.com/developers/v1/full-api>. Read the relevant one
-before changing request construction. Deeper internals-level notes (the OAuth
-signing math, the sync algorithm's dirty-set logic, the freedium/routing
-decisions) live in [`docs/`](docs/) if you want the "why," not just the "what."
+before changing request construction.
 
 ## Testing
 
-84 unit tests across the library modules, stdlib `unittest`, no pytest
+148 unit tests across the library modules, stdlib `unittest`, no pytest
 dependency:
 
 ```sh
