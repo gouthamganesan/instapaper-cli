@@ -26,9 +26,10 @@ with credentials pulled from the OS keychain instead.
 It has since grown into a small package that also speaks Instapaper's
 [Full API](https://www.instapaper.com/developers/v1/full-api) — OAuth 1.0a,
 signed requests, the works — for the things the Simple API structurally cannot
-do: folders, tags, archiving, and pulling your library (with highlights and
-notes) back out as Markdown. The zero-setup path is untouched: if you never
-touch the Full-API flags, this behaves exactly like v1.
+do: folders and tags, listing and organising your library (star, move,
+archive, delete), and pulling it (with highlights and notes) back out as
+Markdown. The zero-setup path is untouched: if you never touch the Full-API
+flags, this behaves exactly like v1.
 
 ## Install
 
@@ -150,7 +151,19 @@ instapaper add "https://example.com"
 # Full API (auto-routed) — needs `instapaper login` first
 instapaper add "https://example.com" --folder starred --tag longread --archive
 instapaper add "https://example.com" --description "for the reading list"
+
+# --folder takes a display name, not just an id — resolved via folders/list
+instapaper add "https://example.com" --folder "Reading List"
+
+# ...and can create the folder on the way in if it doesn't exist yet
+instapaper add "https://example.com" --folder "Board Games" --create-folder
 ```
+
+`--folder` accepts a folder's **display name**, a numeric id, or one of the
+system literals `unread` / `starred` / `archive`. A name is resolved to its id
+via `folders/list`; an unknown name errors (and lists what does exist) unless
+you pass `--create-folder`, which creates it first and then saves into it.
+`--tag` is repeatable — `--tag a --tag b` attaches both.
 
 `--title` and `--selection`/`--description` apply to a single URL. Passing
 them alongside multiple URLs is rejected rather than silently applied to all
@@ -205,6 +218,82 @@ endpoint, and — if OAuth credentials exist — the Full API's
 `verify_credentials`. A missing Full-API login is reported, not treated as an
 error; the command's exit code reflects the Simple-API result only, since
 that's the layer everything else depends on.
+
+### `list` — see what's in a folder
+
+```sh
+instapaper list                              # unread, oldest first: date, id, title, tags
+instapaper list --folder starred
+instapaper list --folder "Reading List"       # by name, id, or unread/starred/archive
+instapaper list --before 2026-06-01           # only saves older than a date
+instapaper list --json                        # id, title, url, saved, time, starred, tags
+```
+
+Full-API only. This is how you find the **bookmark ids** the mutation verbs
+below need — a starred bookmark is marked `*`, tags print as `#tag`, and the
+stderr summary line reports the count. `--folder` resolves a display name the
+same way `add` does.
+
+### `archive` / `unarchive` — move bookmarks in and out of the Archive
+
+```sh
+instapaper archive 2029214705                 # one or more ids (immediate, reversible)
+instapaper archive 2029214705 111 --json
+
+instapaper archive --before 2026-06-01         # BULK: everything in --folder older than a date
+instapaper archive --before 2026-06-01 --apply # dry run without --apply; --folder defaults to unread
+
+instapaper unarchive 2029214705               # move back out of the Archive
+```
+
+`archive` has two modes: give explicit **ids** and it archives them immediately;
+give `--before YYYY-MM-DD` and it bulk-archives everything in `--folder`
+(default `unread`) older than that date — a **dry run** until you add `--apply`.
+(This bulk workflow is what the old `tools/inbox.py archive` did, now folded in.)
+
+### `star` / `unstar` / `move` — organise existing bookmarks
+
+```sh
+instapaper star 2029214705                    # star / unstar one or more ids
+instapaper unstar 2029214705
+instapaper move 2029214705 --folder "Reading List"       # move into a folder (by name or id)
+instapaper move 2029214705 --folder "New Folder" --create-folder
+```
+
+`move` resolves `--folder` the same way `add` does (name, id, or literal) and
+takes `--create-folder` to make the destination on the fly.
+
+### `delete` — permanently remove bookmarks
+
+```sh
+instapaper delete 2029214705                  # refuses: permanent, needs --yes
+instapaper delete 2029214705 111 --yes        # actually deletes (no undo)
+```
+
+`delete` is **permanent** — it destroys the bookmark and its highlights — so it
+will not run without `--yes`. Prefer `archive` when you just want it out of your
+unread queue. Across all these verbs, a per-id failure is reported and does not
+abort the rest; exit `0` only if every id succeeded, and `--json` emits a
+`{"<verb>": [...ids], "failed": [...]}` summary.
+
+### `folder` — list, create, or delete folders
+
+```sh
+instapaper folder list                     # id + title (+ count) per folder
+instapaper folder list --json
+instapaper folder add "Reading List"        # create; prints the new id
+instapaper folder delete "Reading List"     # refuses without --yes; previews what dies
+instapaper folder delete "Reading List" --yes
+instapaper folder delete 5391419 --yes      # by id also works
+```
+
+Full-API only (needs `login`). `folder add` is **idempotent by name**: if a
+folder with that title already exists it reports it and returns the existing id
+rather than making a duplicate. It's the standalone counterpart to
+`add --folder NAME --create-folder`. `folder delete` accepts a name or an id,
+**refuses without `--yes`** (previewing exactly which folders it would remove),
+and deleting a folder does *not* delete its bookmarks — Instapaper moves them
+out of the folder rather than destroying them.
 
 ### `login` — one-time OAuth setup
 
@@ -272,42 +361,13 @@ one-way, Instapaper → your disk.
 - `--dry-run` runs the whole diff and logs intended actions but writes no
   files and doesn't touch the sync state.
 
-### `tools/inbox.py` — list with timestamps, archive existing bookmarks
-
-A small script beside the package, not a subcommand. It covers the two things
-`instapaper` deliberately doesn't: seeing *when* each bookmark was saved, and
-moving an existing one to the Archive folder.
-
-```sh
-python3 tools/inbox.py list                                  # unread, oldest first
-python3 tools/inbox.py list --folder archive --json
-python3 tools/inbox.py list --before 2026-06-01              # only older saves
-
-python3 tools/inbox.py archive --before 2026-06-01           # DRY RUN
-python3 tools/inbox.py archive --before 2026-06-01 --apply   # actually archives
-python3 tools/inbox.py archive --ids 123,456 --apply
-```
-
-Full API only, so `instapaper login` has to have run first. It imports
-`instapaper_cli.creds` and `instapaper_cli.transport` rather than
-reimplementing the OAuth signer, and resolves the package relative to its own
-`__file__`, so it works from any directory.
-
-Three deliberate properties:
-
-- **`archive` is a dry run unless you pass `--apply`.** The dry run prints
-  every bookmark it would touch, so the destructive-looking operation is always
-  previewed first.
-- **Archiving moves, it never deletes.** `/bookmarks/archive` relocates a
-  bookmark to the Archive folder; it stays in your account and can be moved
-  back.
-- **It's a script you invoke by path, not a subcommand.** That's the seam that
-  keeps the CLI's own contract honest — see "What this can and can't do".
-
-Why `list` exists at all: `export` gives you the full text of everything, which
-is the wrong tool for "what's clogging my inbox and how old is it". `list
---json` is the cheap answer, and it's what a triage agent wants before deciding
-anything.
+> **Where did `tools/inbox.py` go?** Earlier versions shipped a standalone
+> `tools/inbox.py` script for listing bookmarks with timestamps and bulk-archiving
+> by date. Both are now first-class CLI commands — `instapaper list` (with
+> `--before` and `--json`) and `instapaper archive --before … [--apply]` — so the
+> script was removed. `instapaper list --json` is still the cheap answer for
+> "what's clogging my inbox and how old is it" (vs. `export`, which downloads full
+> text); a triage agent wants it before deciding anything.
 
 ## What this can and can't do
 
@@ -317,21 +377,32 @@ inbox. That's an API limit, not an unimplemented feature.
 
 The **Full API** (OAuth, opt-in via `login`) adds:
 
-- `add` with `--folder`, `--tag`, `--archive`, `--description`, `--content`
+- `add` with `--folder` (by name, id, or literal), `--tag`, `--archive`,
+  `--description`, `--content`, and `--create-folder`
+- `list` — list a folder's bookmarks (dates, tags, star), with `--before`/`--json`
+- `archive` / `unarchive` — move bookmarks in/out of the Archive (targeted or bulk-by-date)
+- `star` / `unstar` / `move` — organise existing bookmarks
+- `delete` — permanently remove bookmarks (gated behind `--yes`)
+- `folder list` / `folder add` / `folder delete` — enumerate, create, remove folders
 - `export` — read-only pull of bookmarks, highlights, notes, and article text
+
+> **Note on the tool's scope.** Earlier versions of `instapaper` were
+> deliberately add-and-read-only — the one mutating operation (archive) lived
+> in a standalone `tools/inbox.py` script to keep that contract literally true.
+> That constraint has been lifted: reading (`list`) and the write verbs
+> (`archive`/`unarchive`/`star`/`unstar`/`move`/`delete`, plus `folder delete`)
+> are now first-class CLI commands, so the CLI reads *and* writes. The
+> destructive ones are gated — `delete` and `folder delete` refuse to run
+> without `--yes`. `tools/inbox.py` was folded into `list` + `archive` and
+> removed.
 
 Still out of scope, deliberately:
 
-- **No delete.** Nothing in this repo can delete a bookmark. The API supports
-  it; this doesn't implement it.
-- **No archiving from `instapaper` itself.** Archiving an existing bookmark
-  lives in [`tools/inbox.py`](tools/inbox.py) instead (below). Keeping the one
-  mutating call out of the CLI is what lets "`instapaper` only ever adds and
-  reads" stay exactly true rather than approximately true.
-- **No folder-name resolution.** `--folder` on `add` and `export` accepts a
-  numeric folder id or the literals `unread` / `starred` / `archive` — it does
-  not call `folders/list` to resolve a name like `"Reading Later"` to an id.
-  Look the id up yourself (or pass the literal) for now.
+- **`export --folder` still takes an id, not a name.** Folder-name resolution
+  landed on `add --folder` (it calls `folders/list`), but `export --folder`
+  hasn't been given the same treatment yet — it accepts a numeric id or the
+  literals `unread` / `starred` / `archive` / `all`. Use `folder list` to find
+  the id.
 - **No two-way sync.** `export` never writes back to Instapaper — no read
   progress, no highlight creation, nothing. It's a one-way mirror.
 - **Export files are tool-owned.** A re-export overwrites whatever's in the
@@ -402,11 +473,13 @@ became a small package behind a thin entrypoint shim.
 | `instapaper_cli/creds.py` | The only place secrets are touched — username/password/OAuth-token resolution. |
 | `instapaper_cli/config.py` | Non-secret settings (freedium, export dir), atomic JSON writes. |
 | `instapaper_cli/freedium.py` | Paywall-mirror URL wrapping logic. |
+| `instapaper_cli/folders.py` | Folder API + name→id resolution (`list`/`add`/`delete`/`resolve`). |
+| `instapaper_cli/bookmarks.py` | Bookmark mutation verbs — `archive`/`unarchive`/`delete`. |
 | `instapaper_cli/htmlmd.py` | Deliberately-lossy HTML → Markdown conversion for exported article text. |
 | `instapaper_cli/render.py` | Turns a bookmark + highlights + article Markdown into one note file. |
 | `instapaper_cli/sync.py` | The incremental export engine — diffing against Instapaper via `have`/hash. |
 
-84 unit tests cover the library modules (`python3 instapaper_cli/test_*.py`,
+133 unit tests cover the library modules (`python3 instapaper_cli/test_*.py`,
 or `python3 -m unittest discover -s instapaper_cli -p 'test_*.py'`); see
 [Testing](AGENTS.md#testing) in AGENTS.md for the doctrine. Deeper
 design/teaching notes on how the pieces fit together live in

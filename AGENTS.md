@@ -73,46 +73,87 @@ re-export overwrites the file for any bookmark whose hash or highlights
 changed. If the user wants notes alongside an exported article, that's a
 separate file, not an edit to the exported `.md`.
 
-### `tools/inbox.py` — triage the unread queue
-
-The two things `instapaper` deliberately doesn't do: list bookmarks with their
-saved timestamps, and archive an existing one.
+### `folder` — see, create, delete folders
 
 ```sh
-python3 tools/inbox.py list --json                           # read-only, always safe
-python3 tools/inbox.py archive --before YYYY-MM-DD           # DRY RUN by default
-python3 tools/inbox.py archive --before YYYY-MM-DD --apply   # actually archives
+instapaper folder list                        # read-only: id + title per folder
+instapaper folder add "Reading List"           # create (idempotent by name)
+instapaper folder delete "Reading List" --yes  # delete by name or id (needs --yes)
 ```
 
-Trigger `list` on "what's in my inbox", "how old are these", "what's clogging
-my queue". It's the cheap answer — reach for it rather than `export` when the
-user wants to *see* the queue, since `export` downloads every article's full
-text to answer a question about dates.
+Full-API only (`login` required). Reach for `folder list` before saving into a
+named folder you're unsure exists — it's read-only and cheap. `folder add`
+won't duplicate: naming an existing folder just returns its id. To save
+*into* a folder, prefer `add --folder "<name>"` (and `--create-folder` if it
+may not exist yet) over creating the folder separately — one call does both.
+`folder delete` **refuses without `--yes`** and previews what it would remove;
+deleting a folder moves its bookmarks out rather than destroying them.
 
-Full API only, so `login` must have run. It imports `instapaper_cli.creds` and
-`instapaper_cli.transport` directly; don't reimplement the signer, and don't
-patch `sys.path` by hand — it resolves the package from its own `__file__`.
+### `archive` / `delete` — mutate existing bookmarks
 
-**Never run `archive --apply` without showing the dry run first**, and never
-run it on a queue the user hasn't seen. Archiving moves a bookmark to the
-Archive folder and is reversible, but it's still the only operation in this
-repo that changes server state, so it gets the ceremony.
+```sh
+instapaper archive <id> [<id> ...]            # move to Archive (reversible)
+instapaper unarchive <id> [<id> ...]          # move back out
+instapaper star <id> / unstar <id>            # (un)star
+instapaper move <id> --folder "<name>"        # move into a folder (resolves name, --create-folder)
+instapaper delete <id> [<id> ...] --yes       # PERMANENT — refuses without --yes
+```
+
+All take **bookmark ids** (not URLs) and are Full-API only. Get ids from
+`instapaper list` (below) — don't guess one, and if the user gives you a URL,
+resolve it via `list --json` or `export --json` first. `archive`/`star`/`move`
+are reversible. `delete` is irreversible and takes the bookmark's highlights
+with it, so it refuses without `--yes` — surface that refusal and let the user
+decide, rather than adding `--yes` reflexively.
+
+### `list` — read a folder (find ids, triage the queue)
+
+```sh
+instapaper list                               # unread, oldest-first: date, id, title, tags
+instapaper list --folder starred --json
+instapaper list --before YYYY-MM-DD           # only saves older than a date
+```
+
+Read-only, always safe. This is the id-lookup primitive for the mutation verbs,
+and the cheap answer to "what's in my inbox / how old is it" — reach for it
+rather than `export` (which downloads every article's full text) when the user
+just wants to *see* the queue.
+
+### bulk archive by date
+
+```sh
+instapaper archive --before YYYY-MM-DD           # DRY RUN (lists what it would archive)
+instapaper archive --before YYYY-MM-DD --apply   # actually archives; --folder defaults to unread
+```
+
+`archive` with `--before` (instead of ids) bulk-archives everything in `--folder`
+older than the date. **Never run it with `--apply` without showing the dry run
+first**, and never on a queue the user hasn't seen — bulk archiving by date is
+easy to get wrong, and the dry-run is the ceremony that keeps it honest. (This
+replaced the old `tools/inbox.py`, which was folded into the CLI and removed.)
 
 ## What NOT to do
 
-**Do not** attempt to delete a bookmark. Nothing here can, and no amount of
-flag-guessing will find a way. `add`, `export`, and `tools/inbox.py`'s archive
-are the whole mutating surface, and archive only *moves*.
+**Do not** run `instapaper delete` reflexively or in bulk. It is permanent —
+it destroys the bookmark and its highlights — and it takes bookmark ids, so a
+wrong id deletes the wrong thing irreversibly. The `--yes` gate exists for a
+reason: when the user asks to delete, confirm you have the *right* ids (resolve
+from a URL via `instapaper list --json` first if needed) before adding `--yes`.
+Prefer `archive` (reversible) whenever the user's real intent is "get this out
+of my unread queue" rather than "destroy it forever."
 
-**Do not** try to archive from `instapaper` itself. It isn't there by design —
-`tools/inbox.py` is where that lives, precisely so the CLI's "only ever adds
-and reads" contract stays literally true.
+**Do not** treat `folder delete` as harmless because the bookmarks survive —
+it still needs `--yes` and still previews. Don't pass `--yes` on the user's
+behalf without their go-ahead.
 
-**Do not** resolve a folder *name* to an id yourself by guessing or calling
-some other endpoint. `--folder` only accepts a numeric id or the literals
-`unread` / `starred` / `archive`. If the user names a folder like "Reading
-Later", ask them for its numeric id or use one of the literals — don't
-fabricate an id.
+**Do not** fabricate a folder id or guess one. You don't need to: `--folder`
+now takes the folder's **display name** and resolves it via `folders/list`
+itself (a numeric id and the literals `unread` / `starred` / `archive` still
+work too). If the user names a folder that doesn't exist yet, the call errors
+and lists what does — pass `--create-folder` to create-and-save, or run
+`instapaper folder add "<name>"` first. Use `instapaper folder list` to see the
+real folders rather than inventing an id. (`export --folder` is the one place
+that still wants an id, not a name.)
 
 **Do not** ask the user to paste their account password, and do not write it
 into a file or a command. Credential setup (username file + Keychain entry) is
@@ -178,10 +219,11 @@ bookmarks.
 | `instapaper_cli/creds.py` | The only place secrets are touched. Username/password/OAuth-token resolution and persistence. |
 | `instapaper_cli/config.py` | Non-secret settings (freedium config, default export dir) at `~/.config/instapaper/config.json`. Atomic writes (temp file + `os.replace`). |
 | `instapaper_cli/freedium.py` | Decides whether/how to rewrite a URL through a paywall-mirror before sending it to Instapaper. |
+| `instapaper_cli/folders.py` | Folder API + name→id resolution — `list_folders`, `add_folder`, `delete_folder`, `resolve` (name/id/literal, create-on-miss), `resolve_existing` (for delete). Raises, never prints. |
+| `instapaper_cli/bookmarks.py` | Bookmark read/mutation seam — `list_bookmarks`, `archive`, `unarchive`, `star`, `unstar`, `move`, `delete`. One function per `/bookmarks/*` verb; raises, never prints. |
 | `instapaper_cli/htmlmd.py` | Deliberately-lossy HTML → Markdown converter (stdlib `html.parser`) used to render exported article text. |
 | `instapaper_cli/render.py` | Turns a bookmark dict + highlight list + article Markdown into one note file's exact text (frontmatter, `[!quote]` callouts, body). |
 | `instapaper_cli/sync.py` | The incremental `export` engine — diffs local state against the server via `have=id:hash` and a highlight-id delta, fetches only what's dirty. |
-| `tools/inbox.py` | Standalone triage script, **not** part of the CLI's command tree. Lists bookmarks with saved timestamps and archives existing ones. Imports `creds` + `transport`; the only thing in the repo that mutates server state, and its one mutation moves rather than deletes. Lives outside the package on purpose. |
 
 The Simple API contract this depends on is documented at
 <https://www.instapaper.com/developers/v1/simple-api>; the Full API at
